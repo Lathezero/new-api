@@ -102,6 +102,33 @@ export function replaceModelInPath(path: string, modelName: string): string {
 }
 
 /**
+ * Return a copy of the model with the base pricing fields replaced by the
+ * configured group override, or the model itself when the group has none.
+ * The group ratio multiplier is NOT applied here; callers keep multiplying it.
+ */
+export function resolveGroupPricingModel(
+  model: PricingModel,
+  group: string
+): PricingModel {
+  const override = model.group_pricing?.[group]
+  if (!override) return model
+  return {
+    ...model,
+    quota_type: override.quota_type,
+    model_ratio: override.model_ratio,
+    completion_ratio: override.completion_ratio,
+    model_price: override.model_price,
+    cache_ratio: override.cache_ratio,
+    create_cache_ratio: override.create_cache_ratio,
+    image_ratio: override.image_ratio,
+    audio_ratio: override.audio_ratio,
+    audio_completion_ratio: override.audio_completion_ratio,
+    billing_mode: override.billing_mode,
+    billing_expr: override.billing_expr,
+  }
+}
+
+/**
  * Check if model is token-based pricing
  */
 export function isTokenBasedModel(model: PricingModel): boolean {

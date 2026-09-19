@@ -136,6 +136,10 @@ it('keeps provider drafts across tabs and saves nested expressions with the mode
   const user = userEvent.setup()
   const defaultTab = await screen.findByRole('tab', { name: 'Default' })
   expect(defaultTab).toHaveAttribute('aria-selected', 'true')
+  // The group pricing section is always available below the model editor.
+  expect(
+    await screen.findByRole('region', { name: 'Group pricing' })
+  ).toBeVisible()
   expect(
     await screen.findByText(
       'The model-level expression cannot be evaluated by: Beta'

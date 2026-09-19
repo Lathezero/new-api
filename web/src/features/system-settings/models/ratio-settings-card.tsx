@@ -31,16 +31,21 @@ import { Button } from '@/components/ui/button'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   buildPricingChanges,
+  groupPricingByModel,
   useModelPricing,
   useSaveModelPricing,
   type ModelPricingConfig,
 } from '@/features/model-pricing/api'
-import { pricingOptions } from '@/features/model-pricing/pricing'
+import {
+  pricingOptions,
+  type GroupPricingValues,
+} from '@/features/model-pricing/pricing'
 import { handleServerError } from '@/lib/handle-server-error'
 
 import { SettingsPageTitleStatusPortal } from '../components/settings-page-context'
 import { SettingsSection } from '../components/settings-section'
 import { useUpdateOption } from '../hooks/use-update-option'
+import { safeJsonParse } from '../utils/json-parser'
 import { positiveIntegerSchema } from '../utils/numeric-field'
 import { GroupRatioForm } from './group-ratio-form'
 import { ModelRatioForm } from './model-ratio-form'
@@ -128,6 +133,7 @@ const createModelSchema = (t: Translate) =>
     BillingMode: createJsonStringField(t),
     BillingExpr: createJsonStringField(t),
     PluginBillingExpr: createJsonStringField(t),
+    GroupModelPricing: createJsonStringField(t),
   })
 
 const createGroupSchema = (t: Translate) =>
@@ -196,8 +202,11 @@ export function RatioSettingsCard({
               pricingBaseline.options['billing_setting.billing_expr'],
             PluginBillingExpr:
               pricingBaseline.options['billing_setting.plugin_billing_expr'],
+            GroupModelPricing: JSON.stringify(
+              groupPricingByModel(pricingBaseline)
+            ),
           }
-        : initialModelDefaults,
+        : { ...initialModelDefaults, GroupModelPricing: '{}' },
     [initialModelDefaults, pricingBaseline]
   )
   const resetMutation = useMutation({
@@ -236,6 +245,7 @@ export function RatioSettingsCard({
     BillingMode: normalizeJsonString(modelDefaults.BillingMode),
     BillingExpr: normalizeJsonString(modelDefaults.BillingExpr),
     PluginBillingExpr: normalizeJsonString(modelDefaults.PluginBillingExpr),
+    GroupModelPricing: normalizeJsonString(modelDefaults.GroupModelPricing),
   })
   const [savedModelValues, setSavedModelValues] = useState(
     modelNormalizedDefaults.current
@@ -309,6 +319,7 @@ export function RatioSettingsCard({
       BillingMode: normalizeJsonString(modelDefaults.BillingMode),
       BillingExpr: normalizeJsonString(modelDefaults.BillingExpr),
       PluginBillingExpr: normalizeJsonString(modelDefaults.PluginBillingExpr),
+      GroupModelPricing: normalizeJsonString(modelDefaults.GroupModelPricing),
     }
     setSavedModelValues(modelNormalizedDefaults.current)
 
@@ -372,6 +383,7 @@ export function RatioSettingsCard({
         BillingMode: normalizeJsonString(values.BillingMode),
         BillingExpr: normalizeJsonString(values.BillingExpr),
         PluginBillingExpr: normalizeJsonString(values.PluginBillingExpr),
+        GroupModelPricing: normalizeJsonString(values.GroupModelPricing),
       }
 
       if (!pricingBaseline) return
@@ -379,7 +391,13 @@ export function RatioSettingsCard({
         const changes = buildPricingChanges(
           pricingBaseline,
           pricingOptions(modelNormalizedDefaults.current),
-          pricingOptions(normalized)
+          pricingOptions(normalized),
+          {
+            before: groupPricingByModel(pricingBaseline),
+            after: safeJsonParse<
+              Record<string, Record<string, GroupPricingValues>>
+            >(normalized.GroupModelPricing, { fallback: {}, silent: true }),
+          }
         )
         const visibilityChanged =
           normalized.ExposeRatioEnabled !==

@@ -61,7 +61,7 @@ import { requireServerSuccess } from '@/lib/server-error-message'
 import { cn } from '@/lib/utils'
 import { useSystemConfigStore } from '@/stores/system-config-store'
 
-import { DEFAULT_TOKEN_UNIT } from '../constants'
+import { DEFAULT_TOKEN_UNIT, QUOTA_TYPE_VALUES } from '../constants'
 import { useBillingTime } from '../hooks/use-billing-time'
 import { usePricingData } from '../hooks/use-pricing-data'
 import type { ParsedTaskTier } from '../lib/billing-expr'
@@ -78,7 +78,11 @@ import {
   type DynamicPriceEntry,
 } from '../lib/dynamic-price'
 import { parseTags } from '../lib/filters'
-import { getAvailableGroups, isTokenBasedModel } from '../lib/model-helpers'
+import {
+  getAvailableGroups,
+  isTokenBasedModel,
+  resolveGroupPricingModel,
+} from '../lib/model-helpers'
 import { withPluginPricing } from '../lib/plugin-pricing'
 import { formatFixedPrice, formatGroupPrice } from '../lib/price'
 import {
@@ -1030,7 +1034,12 @@ function GroupPricingSection(props: GroupPricingSectionProps) {
             {variant.billing_expr || variant.billing_mode === 'ratio' ? (
               <ProviderGroupPricingSection
                 {...props}
-                model={withPluginPricing(props.model, variant)}
+                model={{
+                  ...withPluginPricing(props.model, variant),
+                  // Provider-specific pricing reflects upstream metering; group
+                  // overrides only apply to the model's own pricing view.
+                  group_pricing: undefined,
+                }}
                 hideTitle
               />
             ) : (
@@ -1060,27 +1069,37 @@ function ProviderGroupPricingSection(
   const tokenUnitLabel = props.tokenUnit === 'K' ? '1K' : '1M'
 
   const extraPriceTypes = useMemo(() => {
+    // Columns cover the base pricing and every group override, so a ratio
+    // configured only for one group is still visible for that group.
+    const resolved = [
+      props.model,
+      ...availableGroups.map((group) =>
+        resolveGroupPricingModel(props.model, group)
+      ),
+    ]
     const types: { label: string; type: PriceType }[] = []
-    if (props.model.cache_ratio != null) {
+    if (resolved.some((model) => model.cache_ratio != null)) {
       types.push({ label: t('Cache'), type: 'cache' })
     }
-    if (props.model.create_cache_ratio != null) {
+    if (resolved.some((model) => model.create_cache_ratio != null)) {
       types.push({ label: t('Cache Write'), type: 'create_cache' })
     }
-    if (props.model.image_ratio != null) {
+    if (resolved.some((model) => model.image_ratio != null)) {
       types.push({ label: t('Image'), type: 'image' })
     }
-    if (props.model.audio_ratio != null) {
+    if (resolved.some((model) => model.audio_ratio != null)) {
       types.push({ label: t('Audio In'), type: 'audio_input' })
     }
     if (
-      props.model.audio_ratio != null &&
-      props.model.audio_completion_ratio != null
+      resolved.some(
+        (model) =>
+          model.audio_ratio != null && model.audio_completion_ratio != null
+      )
     ) {
       types.push({ label: t('Audio Out'), type: 'audio_output' })
     }
     return types
-  }, [props.model, t])
+  }, [props.model, availableGroups, t])
 
   if (availableGroups.length === 0) {
     return (
@@ -1110,11 +1129,12 @@ function ProviderGroupPricingSection(
           props.model.billing_usage_schema
         )
       : getDynamicPricingTiers(props.model)
-    const hasRequestPrice = dynamicTiers.some(
-      (tier) => !('unitPrices' in tier) && tier.billingUnit === 'request'
+    // Keep the whole-section notice when no group override exists; otherwise
+    // each group renders from its own expression below.
+    const hasAnyGroupOverride = availableGroups.some(
+      (group) => props.model.group_pricing?.[group]
     )
-
-    if (dynamicTiers.length === 0) {
+    if (dynamicTiers.length === 0 && !hasAnyGroupOverride) {
       return (
         <section>
           {!props.hideTitle && (
@@ -1143,36 +1163,6 @@ function ProviderGroupPricingSection(
       )
     }
 
-    const usageExampleRows = evaluateTaskUsageExamples(
-      props.model.billing_expr,
-      props.model.billing_usage_schema,
-      props.model.billing_usage_examples
-    )
-    const priceFields = getDynamicPriceFields(dynamicTiers, {
-      tokenUnit: props.tokenUnit,
-      showRechargePrice,
-      priceRate: props.priceRate,
-      usdExchangeRate: props.usdExchangeRate,
-      groupRatioMultiplier: 1,
-      usageSchema: props.model.billing_usage_schema,
-    })
-    const formattedPricesByGroup = new Map(
-      availableGroups.map((group) => {
-        const ratio = props.groupRatio[group] || 1
-        return [
-          group,
-          getDynamicFormattedPricesByTier(dynamicTiers, {
-            tokenUnit: props.tokenUnit,
-            showRechargePrice,
-            priceRate: props.priceRate,
-            usdExchangeRate: props.usdExchangeRate,
-            groupRatioMultiplier: ratio,
-            usageSchema: props.model.billing_usage_schema,
-          }),
-        ] as const
-      })
-    )
-
     return (
       <section>
         {!props.hideTitle && (
@@ -1182,9 +1172,110 @@ function ProviderGroupPricingSection(
         <div className='space-y-3'>
           {availableGroups.map((group) => {
             const ratio = props.groupRatio[group] || 1
-            const formattedPricesByTier =
-              formattedPricesByGroup.get(group) ??
-              new Map<DynamicPricingTier, Map<string, string>>()
+            // A group override may carry its own expression or switch the
+            // group to ratio/fixed pricing entirely.
+            const groupModel = resolveGroupPricingModel(props.model, group)
+            const groupDynamic = isDynamicPricingModel(groupModel)
+            let groupTiers: DynamicPricingTier[] = []
+            if (groupDynamic) {
+              groupTiers = groupModel.billing_usage_schema
+                ? getTaskPricingDisplayTiers(
+                    groupModel.billing_expr,
+                    groupModel.billing_usage_schema
+                  )
+                : getDynamicPricingTiers(groupModel)
+            }
+            const formattedPricesByTier = getDynamicFormattedPricesByTier(
+              groupTiers,
+              {
+                tokenUnit: props.tokenUnit,
+                showRechargePrice,
+                priceRate: props.priceRate,
+                usdExchangeRate: props.usdExchangeRate,
+                groupRatioMultiplier: ratio,
+                usageSchema: groupModel.billing_usage_schema,
+              }
+            )
+            // Columns must follow each group's own tiers: a group override
+            // expression may use a different billing unit than the base
+            // expression (e.g. per-token vs fixed per-request).
+            const groupPriceFields = getDynamicPriceFields(groupTiers, {
+              tokenUnit: props.tokenUnit,
+              showRechargePrice,
+              priceRate: props.priceRate,
+              usdExchangeRate: props.usdExchangeRate,
+              groupRatioMultiplier: 1,
+              usageSchema: groupModel.billing_usage_schema,
+            })
+            const groupHasRequestPrice = groupTiers.some(
+              (tier) => !('unitPrices' in tier) && tier.billingUnit === 'request'
+            )
+            const usageExampleRows = evaluateTaskUsageExamples(
+              groupModel.billing_expr,
+              groupModel.billing_usage_schema,
+              groupModel.billing_usage_examples
+            )
+
+            if (groupDynamic && groupTiers.length === 0) {
+              return (
+                <div
+                  key={group}
+                  className='overflow-hidden rounded-lg border'
+                >
+                  <div className='bg-muted/20 flex items-center justify-between gap-3 border-b px-3 py-2'>
+                    <GroupBadge group={group} size='sm' />
+                    <span className='text-muted-foreground font-mono text-xs'>
+                      {ratio}x
+                    </span>
+                  </div>
+                  <div className='px-3 py-2.5'>
+                    <p className='text-muted-foreground text-xs'>
+                      {t(
+                        'Group prices cannot be expanded because this expression is not a standard tiered pricing expression.'
+                      )}
+                    </p>
+                    <code className='text-muted-foreground mt-2 block font-mono text-xs break-all'>
+                      {groupModel.billing_expr}
+                    </code>
+                  </div>
+                </div>
+              )
+            }
+
+            if (!groupDynamic) {
+              return (
+                <div
+                  key={group}
+                  className='overflow-hidden rounded-lg border'
+                >
+                  <div className='bg-muted/20 flex items-center justify-between gap-3 border-b px-3 py-2'>
+                    <GroupBadge group={group} size='sm' />
+                    <span className='text-muted-foreground font-mono text-xs'>
+                      {ratio}x
+                    </span>
+                  </div>
+                  <div className='text-muted-foreground px-3 py-2.5 text-sm'>
+                    {groupModel.quota_type === QUOTA_TYPE_VALUES.REQUEST ? (
+                      <span className='font-mono'>
+                        {formatFixedPrice(
+                          groupModel,
+                          group,
+                          showRechargePrice,
+                          props.priceRate,
+                          props.usdExchangeRate,
+                          props.groupRatio
+                        )}
+                        {` / ${t('request')}`}
+                      </span>
+                    ) : (
+                      <span className='font-mono'>
+                        {`${t('Input')} ${formatGroupPrice(groupModel, group, 'input', props.tokenUnit, showRechargePrice, props.priceRate, props.usdExchangeRate, props.groupRatio)} · ${t('Output')} ${formatGroupPrice(groupModel, group, 'output', props.tokenUnit, showRechargePrice, props.priceRate, props.usdExchangeRate, props.groupRatio)}`}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )
+            }
 
             return (
               <div key={group} className='overflow-hidden rounded-lg border'>
@@ -1198,7 +1289,7 @@ function ProviderGroupPricingSection(
                   className='rounded-none border-0'
                   tableClassName='text-sm'
                   headerRowClassName='hover:bg-transparent'
-                  data={dynamicTiers}
+                  data={groupTiers}
                   getRowKey={(tier, tierIndex) =>
                     `${group}-${tier.label || tierIndex}`
                   }
@@ -1224,7 +1315,7 @@ function ProviderGroupPricingSection(
                                     t
                                   ) ||
                                   t(
-                                    dynamicTiers.length > 1
+                                    groupTiers.length > 1
                                       ? 'Other cases'
                                       : 'All requests'
                                   )
@@ -1237,7 +1328,7 @@ function ProviderGroupPricingSection(
                             },
                           },
                         ]),
-                    ...priceFields.map((fieldEntry) => {
+                    ...groupPriceFields.map((fieldEntry) => {
                       const unitLabelKey =
                         getDynamicPriceUnitLabelKey(fieldEntry)
                       let unitLabel = taskUsageUnitLabel(
@@ -1245,7 +1336,7 @@ function ProviderGroupPricingSection(
                         i18n.language,
                         unitLabelKey ? t(unitLabelKey) : ''
                       )
-                      if (!unitLabel && hasRequestPrice) {
+                      if (!unitLabel && groupHasRequestPrice) {
                         unitLabel = t('{{unit}} tokens', {
                           unit: tokenUnitLabel,
                         })
@@ -1343,9 +1434,13 @@ function ProviderGroupPricingSection(
     )
   }
 
-  const renderGroupPrice = (group: string, type: PriceType) =>
-    formatGroupPrice(
-      props.model,
+  const renderGroupPrice = (group: string, type: PriceType) => {
+    const groupModel = resolveGroupPricingModel(props.model, group)
+    if (isDynamicPricingModel(groupModel)) {
+      return type === 'input' ? t('Expression pricing') : '—'
+    }
+    return formatGroupPrice(
+      groupModel,
       group,
       type,
       props.tokenUnit,
@@ -1354,15 +1449,21 @@ function ProviderGroupPricingSection(
       props.usdExchangeRate,
       props.groupRatio
     )
-  const renderFixedGroupPrice = (group: string) =>
-    formatFixedPrice(
-      props.model,
+  }
+  const renderFixedGroupPrice = (group: string) => {
+    const groupModel = resolveGroupPricingModel(props.model, group)
+    if (isDynamicPricingModel(groupModel)) {
+      return t('Expression pricing')
+    }
+    return formatFixedPrice(
+      groupModel,
       group,
       showRechargePrice,
       props.priceRate,
       props.usdExchangeRate,
       props.groupRatio
     )
+  }
 
   return (
     <section>

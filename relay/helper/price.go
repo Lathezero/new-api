@@ -71,6 +71,10 @@ func HandleGroupRatio(ctx *gin.Context, relayInfo *relaycommon.RelayInfo) hostty
 		groupRatioInfo.GroupRatio = ratio_setting.GetGroupRatio(relayInfo.UsingGroup)
 	}
 
+	if _, ok := billing_setting.GetGroupModelPricing(relayInfo.GetBillingModelName(), relayInfo.UsingGroup); ok {
+		groupRatioInfo.GroupPricingApplied = true
+	}
+
 	return groupRatioInfo
 }
 
@@ -81,14 +85,18 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		}
 	}
 	billingModelName := info.GetBillingModelName()
-	modelPrice, usePrice := ratio_setting.GetModelPrice(billingModelName, false)
 
+	// The using group (including auto_group resolution) must be known before
+	// pricing lookup so per-group pricing overrides can apply.
 	groupRatioInfo := HandleGroupRatio(c, info)
+	group := info.UsingGroup
 
-	// Check if this model uses tiered_expr billing
-	if billing_setting.GetBillingMode(billingModelName) == billing_setting.BillingModeTieredExpr {
+	// Check if this model uses tiered_expr billing (group override aware)
+	if billing_setting.GetGroupBillingMode(billingModelName, group) == billing_setting.BillingModeTieredExpr {
 		return modelPriceHelperTiered(c, info, billingModelName, promptTokens, meta, groupRatioInfo)
 	}
+
+	modelPrice, usePrice := billing_setting.GetGroupModelPrice(billingModelName, group, false)
 
 	var preConsumedQuota int
 	var modelRatio float64
@@ -108,7 +116,7 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 		}
 		var success bool
 		var matchName string
-		modelRatio, success, matchName = ratio_setting.GetModelRatio(billingModelName)
+		modelRatio, success, matchName = billing_setting.GetGroupModelRatio(billingModelName, group)
 		if !success {
 			acceptUnsetRatio := false
 			if info.UserSetting.AcceptUnsetRatioModel {
@@ -118,15 +126,26 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 				return hosttypes.PriceData{}, modelPriceNotConfiguredError(matchName, info.UserId)
 			}
 		}
-		completionRatio = ratio_setting.GetCompletionRatio(billingModelName)
+		completionRatio = billing_setting.GetGroupCompletionRatio(billingModelName, group)
 		cacheRatio, _ = ratio_setting.GetCacheRatio(billingModelName)
 		cacheCreationRatio, _ = ratio_setting.GetCreateCacheRatio(billingModelName)
+		imageRatio, _ = ratio_setting.GetImageRatio(billingModelName)
+		audioRatio = billing_setting.GetGroupAudioRatio(billingModelName, group)
+		audioCompletionRatio = billing_setting.GetGroupAudioCompletionRatio(billingModelName, group)
+		if groupPricing, ok := billing_setting.GetGroupModelPricing(billingModelName, group); ok {
+			if groupPricing.CacheRatio != nil {
+				cacheRatio = *groupPricing.CacheRatio
+			}
+			if groupPricing.CreateCacheRatio != nil {
+				cacheCreationRatio = *groupPricing.CreateCacheRatio
+			}
+			if groupPricing.ImageRatio != nil {
+				imageRatio = *groupPricing.ImageRatio
+			}
+		}
 		cacheCreationRatio5m = cacheCreationRatio
 		// 固定1h和5min缓存写入价格的比例
 		cacheCreationRatio1h = cacheCreationRatio * claudeCacheCreation1hMultiplier
-		imageRatio, _ = ratio_setting.GetImageRatio(billingModelName)
-		audioRatio = ratio_setting.GetAudioRatio(billingModelName)
-		audioCompletionRatio = ratio_setting.GetAudioCompletionRatio(billingModelName)
 		ratio := modelRatio * groupRatioInfo.GroupRatio
 		quota, err := common.QuotaFromFloatStrict(float64(preConsumedTokens) * ratio)
 		if err != nil {
@@ -233,19 +252,23 @@ func ModelPriceHelper(c *gin.Context, info *relaycommon.RelayInfo, promptTokens 
 func ModelPriceHelperPerCall(c *gin.Context, info *relaycommon.RelayInfo) (hosttypes.PriceData, error) {
 	groupRatioInfo := HandleGroupRatio(c, info)
 
-	modelPrice, success := ratio_setting.GetModelPrice(info.OriginModelName, true)
+	modelPrice, success := billing_setting.GetGroupModelPrice(info.OriginModelName, info.UsingGroup, true)
 	usePrice := success
 	var modelRatio float64
 
 	if !success {
-		defaultPrice, ok := ratio_setting.GetDefaultModelPriceMap()[info.OriginModelName]
-		if ok {
+		// An explicit group ratio override bills by ratio for this group and
+		// takes precedence over the built-in default per-call price.
+		groupPricing, hasGroupPricing := billing_setting.GetGroupModelPricing(info.OriginModelName, info.UsingGroup)
+		if hasGroupPricing && groupPricing.ModelRatio != nil {
+			modelRatio = *groupPricing.ModelRatio
+		} else if defaultPrice, ok := ratio_setting.GetDefaultModelPriceMap()[info.OriginModelName]; ok {
 			modelPrice = defaultPrice
 			usePrice = true
 		} else {
 			var ratioSuccess bool
 			var matchName string
-			modelRatio, ratioSuccess, matchName = ratio_setting.GetModelRatio(info.OriginModelName)
+			modelRatio, ratioSuccess, matchName = billing_setting.GetGroupModelRatio(info.OriginModelName, info.UsingGroup)
 			acceptUnsetRatio := false
 			if info.UserSetting.AcceptUnsetRatioModel {
 				acceptUnsetRatio = true
@@ -357,7 +380,7 @@ func resolveBillingModelName(origin string) string {
 }
 
 func modelPriceHelperTiered(c *gin.Context, info *relaycommon.RelayInfo, billingModelName string, promptTokens int, meta *types.TokenCountMeta, groupRatioInfo hosttypes.GroupRatioInfo) (hosttypes.PriceData, error) {
-	exprStr, ok := billing_setting.GetBillingExpr(billingModelName)
+	exprStr, ok := billing_setting.GetGroupBillingExpr(billingModelName, info.UsingGroup)
 	if !ok {
 		return hosttypes.PriceData{}, fmt.Errorf("model %s is configured as tiered_expr but has no billing expression", billingModelName)
 	}

@@ -63,6 +63,7 @@ type ModelFormValues = {
   BillingMode: string
   BillingExpr: string
   PluginBillingExpr: string
+  GroupModelPricing: string
 }
 
 type ModelRatioFormProps = {
@@ -329,6 +330,7 @@ export const ModelRatioForm = memo(function ModelRatioForm({
               billingMode={form.watch('BillingMode')}
               billingExpr={form.watch('BillingExpr')}
               pluginBillingExpr={form.watch('PluginBillingExpr')}
+              groupModelPricing={form.watch('GroupModelPricing')}
               candidateModelNames={
                 isUnsetVariant ? enabledModelsQuery.data?.data : undefined
               }

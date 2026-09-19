@@ -25,6 +25,24 @@ type PricingPluginVariant struct {
 	BillingUsageExamples []jsplugin.UsageExample              `json:"billing_usage_examples,omitempty"`
 }
 
+// PricingGroupOverride is the resolved pricing for one group with a
+// configured (model, group) override. Fields mirror the model-level Pricing
+// fields so the pricing page can swap the base values per group; the group
+// ratio multiplier still applies on top.
+type PricingGroupOverride struct {
+	QuotaType            int      `json:"quota_type"`
+	ModelRatio           float64  `json:"model_ratio"`
+	ModelPrice           float64  `json:"model_price"`
+	CompletionRatio      float64  `json:"completion_ratio"`
+	CacheRatio           *float64 `json:"cache_ratio,omitempty"`
+	CreateCacheRatio     *float64 `json:"create_cache_ratio,omitempty"`
+	ImageRatio           *float64 `json:"image_ratio,omitempty"`
+	AudioRatio           *float64 `json:"audio_ratio,omitempty"`
+	AudioCompletionRatio *float64 `json:"audio_completion_ratio,omitempty"`
+	BillingMode          string   `json:"billing_mode,omitempty"`
+	BillingExpr          string   `json:"billing_expr,omitempty"`
+}
+
 type Pricing struct {
 	BillingPluginVariants  []PricingPluginVariant               `json:"billing_plugin_variants,omitempty"`
 	ModelName              string                               `json:"model_name"`
@@ -43,6 +61,7 @@ type Pricing struct {
 	AudioRatio             *float64                             `json:"audio_ratio,omitempty"`
 	AudioCompletionRatio   *float64                             `json:"audio_completion_ratio,omitempty"`
 	EnableGroup            []string                             `json:"enable_groups"`
+	GroupPricing           map[string]PricingGroupOverride      `json:"group_pricing,omitempty"`
 	SupportedEndpointTypes []constant.EndpointType              `json:"supported_endpoint_types"`
 	BillingMode            string                               `json:"billing_mode,omitempty"`
 	BillingExpr            string                               `json:"billing_expr,omitempty"`
@@ -331,6 +350,7 @@ func updatePricing() {
 			ModelName:              model,
 			EnableGroup:            groups.Items(),
 			SupportedEndpointTypes: modelSupportEndpointTypes[model],
+			GroupPricing:           buildGroupPricingOverrides(model, groups.Items()),
 		}
 
 		// 补充模型元数据（描述、标签、供应商、状态）
@@ -445,6 +465,70 @@ func updatePricing() {
 	modelEnableGroupsLock.Unlock()
 
 	lastGetPricingTime = time.Now()
+}
+
+// buildGroupPricingOverrides resolves the effective pricing of every group
+// that has a configured (model, group) override. Groups without an override
+// are omitted; the pricing page falls back to the model-level values for them.
+func buildGroupPricingOverrides(model string, groups []string) map[string]PricingGroupOverride {
+	var result map[string]PricingGroupOverride
+	for _, group := range groups {
+		groupPricing, ok := billing_setting.GetGroupModelPricing(model, group)
+		if !ok {
+			continue
+		}
+		override := PricingGroupOverride{
+			BillingMode: billing_setting.GetGroupBillingMode(model, group),
+		}
+		if override.BillingMode == billing_setting.BillingModeTieredExpr {
+			if expr, ok := billing_setting.GetGroupBillingExpr(model, group); ok {
+				override.BillingExpr = expr
+			}
+		}
+		if modelPrice, usePrice := billing_setting.GetGroupModelPrice(model, group, false); usePrice {
+			override.ModelPrice = modelPrice
+			override.QuotaType = 1
+		} else {
+			modelRatio, _, _ := billing_setting.GetGroupModelRatio(model, group)
+			override.ModelRatio = modelRatio
+			override.CompletionRatio = billing_setting.GetGroupCompletionRatio(model, group)
+			override.QuotaType = 0
+		}
+		cacheRatio, hasCache := ratio_setting.GetCacheRatio(model)
+		if groupPricing.CacheRatio != nil {
+			cacheRatio, hasCache = *groupPricing.CacheRatio, true
+		}
+		if hasCache {
+			override.CacheRatio = &cacheRatio
+		}
+		createCacheRatio, hasCreateCache := ratio_setting.GetCreateCacheRatio(model)
+		if groupPricing.CreateCacheRatio != nil {
+			createCacheRatio, hasCreateCache = *groupPricing.CreateCacheRatio, true
+		}
+		if hasCreateCache {
+			override.CreateCacheRatio = &createCacheRatio
+		}
+		imageRatio, hasImage := ratio_setting.GetImageRatio(model)
+		if groupPricing.ImageRatio != nil {
+			imageRatio, hasImage = *groupPricing.ImageRatio, true
+		}
+		if hasImage {
+			override.ImageRatio = &imageRatio
+		}
+		audioRatio := billing_setting.GetGroupAudioRatio(model, group)
+		if groupPricing.AudioRatio != nil || ratio_setting.ContainsAudioRatio(model) {
+			override.AudioRatio = &audioRatio
+		}
+		audioCompletionRatio := billing_setting.GetGroupAudioCompletionRatio(model, group)
+		if groupPricing.AudioCompletionRatio != nil || ratio_setting.ContainsAudioCompletionRatio(model) {
+			override.AudioCompletionRatio = &audioCompletionRatio
+		}
+		if result == nil {
+			result = make(map[string]PricingGroupOverride)
+		}
+		result[group] = override
+	}
+	return result
 }
 
 // GetSupportedEndpointMap 返回全局端点到路径的映射

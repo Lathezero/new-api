@@ -35,8 +35,11 @@ import { createServerError } from '@/lib/server-error-message'
 import { useAuthStore } from '@/stores/auth-store'
 
 import {
+  GROUP_MODEL_PRICING_KEY,
   PRICING_KEYS,
+  groupPricingEqual,
   pricingValuesByModel,
+  type GroupPricingValues,
   type PricingOptions,
   type PricingValues,
   type CacheWriteMode,
@@ -61,11 +64,17 @@ export type ModelPricingPluginVariant = {
   stale?: boolean
 }
 
+export type ModelPricingGroupEntry = {
+  configured: PricingValues
+  effective: PricingValues
+}
+
 export type ModelPricingEntry = ModelPricingDescription & {
   plugin_variants?: ModelPricingPluginVariant[]
   model_name: string
   version: string
   configured: PricingValues
+  groups?: Record<string, ModelPricingGroupEntry>
   usage_schema?: BillingUsageSchema
 }
 
@@ -171,20 +180,49 @@ export function useSaveModelPricing() {
   })
 }
 
+// groupPricingByModel reconstructs the (model → group → fields) override map
+// from a pricing snapshot, for diffing against edited form state.
+export function groupPricingByModel(
+  snapshot: ModelPricingConfig
+): Record<string, Record<string, GroupPricingValues>> {
+  const result: Record<string, Record<string, GroupPricingValues>> = {}
+  for (const entry of snapshot.entries) {
+    const groups = entry.configured[GROUP_MODEL_PRICING_KEY]
+    if (groups && Object.keys(groups).length > 0) {
+      result[entry.model_name] = groups
+    }
+  }
+  return result
+}
+
 // Only dirty model fields are applied to stored configuration. Display-only
 // built-in expressions for other models never become administrator overrides.
+// groupPricing carries the (model → group → fields) maps before and after the
+// edit; a model with only group-override changes still produces a change.
 export function buildPricingChanges(
   snapshot: ModelPricingConfig,
   before: PricingOptions,
-  after: PricingOptions
+  after: PricingOptions,
+  groupPricing?: {
+    before: Record<string, Record<string, GroupPricingValues>>
+    after: Record<string, Record<string, GroupPricingValues>>
+  }
 ): ModelPricingChange[] {
   const previous = pricingValuesByModel(before)
   const next = pricingValuesByModel(after)
+  const groupBefore = groupPricing?.before ?? {}
+  const groupAfter = groupPricing?.after ?? {}
   const entries = new Map(
     snapshot.entries.map((entry) => [entry.model_name, entry])
   )
   const changes: ModelPricingChange[] = []
-  for (const name of new Set([...previous.keys(), ...next.keys()])) {
+  const names = new Set([
+    ...previous.keys(),
+    ...next.keys(),
+    ...Object.keys(groupBefore),
+    ...Object.keys(groupAfter),
+  ])
+  for (const name of names) {
     const oldValues = previous.get(name) ?? {}
     const newValues = next.get(name) ?? {}
     const dirty = PRICING_KEYS.filter((key) =>
@@ -192,13 +230,21 @@ export function buildPricingChanges(
         ? !pluginExpressionsEqual(oldValues[key], newValues[key])
         : oldValues[key] !== newValues[key]
     )
-    if (!dirty.length) continue
+    const groupsChanged = !groupPricingEqual(groupBefore[name], groupAfter[name])
+    if (!dirty.length && !groupsChanged) continue
     const entry = entries.get(name)
     const pricing = { ...entry?.configured }
     for (const key of dirty) {
       delete pricing[key]
       if (newValues[key] !== undefined) {
         Object.assign(pricing, { [key]: newValues[key] })
+      }
+    }
+    if (groupsChanged) {
+      delete pricing[GROUP_MODEL_PRICING_KEY]
+      const groups = groupAfter[name]
+      if (groups && Object.keys(groups).length > 0) {
+        pricing[GROUP_MODEL_PRICING_KEY] = groups
       }
     }
     if (newValues['billing_setting.billing_mode'] === 'tiered_expr') {

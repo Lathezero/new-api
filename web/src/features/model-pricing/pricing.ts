@@ -43,6 +43,20 @@ export const PRICING_KEYS = [
   'billing_setting.plugin_billing_expr',
 ] as const
 export type PricingKey = (typeof PRICING_KEYS)[number]
+
+/** Per-group pricing override fields; a subset of the model-level keys. */
+export type GroupPricingValues = Partial<
+  Record<
+    Exclude<
+      PricingKey,
+      'billing_setting.plugin_billing_expr'
+    >,
+    number | string
+  >
+>
+
+export const GROUP_MODEL_PRICING_KEY = 'billing_setting.group_model_pricing'
+
 export type PricingValues = Partial<
   Record<
     Exclude<PricingKey, 'billing_setting.plugin_billing_expr'>,
@@ -50,6 +64,7 @@ export type PricingValues = Partial<
   >
 > & {
   'billing_setting.plugin_billing_expr'?: Record<string, string>
+  'billing_setting.group_model_pricing'?: Record<string, GroupPricingValues>
 }
 export type PricingOptions = Record<PricingKey, string>
 
@@ -322,6 +337,36 @@ export function pricingValuesByModel(
     }
   }
   return models
+}
+
+/** Stable serialization for group pricing maps (keys sorted at both levels). */
+function stableGroupPricingStringify(
+  groups: Record<string, GroupPricingValues>
+): string {
+  const sortedGroups = Object.fromEntries(
+    Object.entries(groups)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([group, fields]) => [
+        group,
+        Object.fromEntries(
+          Object.entries(fields).sort(([a], [b]) => a.localeCompare(b))
+        ),
+      ])
+  )
+  return JSON.stringify(sortedGroups)
+}
+
+/** Compare two per-group override maps; missing and empty are equivalent. */
+export function groupPricingEqual(
+  a?: Record<string, GroupPricingValues>,
+  b?: Record<string, GroupPricingValues>
+): boolean {
+  const normalize = (value?: Record<string, GroupPricingValues>) =>
+    value && Object.keys(value).length > 0 ? value : undefined
+  const left = normalize(a)
+  const right = normalize(b)
+  if (!left || !right) return left === right
+  return stableGroupPricingStringify(left) === stableGroupPricingStringify(right)
 }
 
 export function applyPriceSyncSelections(

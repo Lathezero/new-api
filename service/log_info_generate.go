@@ -46,6 +46,18 @@ func attachQuotaSaturation(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, o
 		clamp.Op, clamp.Kind, clamp.Original, clamp.Clamped, relayInfo.UserId, relayInfo.GetBillingModelName()))
 }
 
+// attachGroupPricingMarker records that a (model, group) pricing override
+// participated in billing this request, nested under admin_info so only
+// admins see it. No-op when no override applied.
+func attachGroupPricingMarker(relayInfo *relaycommon.RelayInfo, other *model.LogOther) {
+	if relayInfo == nil || other == nil {
+		return
+	}
+	if relayInfo.PriceData.GroupRatioInfo.GroupPricingApplied {
+		other.SetAdmin("group_pricing", relayInfo.UsingGroup)
+	}
+}
+
 func appendRequestPath(ctx *gin.Context, relayInfo *relaycommon.RelayInfo, other *model.LogOther) {
 	if other == nil {
 		return
@@ -325,6 +337,9 @@ func GenerateMjOtherInfo(relayInfo *relaycommon.RelayInfo, priceData hosttypes.P
 	other.SetPublic("group_ratio", priceData.GroupRatioInfo.GroupRatio)
 	if priceData.GroupRatioInfo.HasSpecialRatio {
 		other.SetPublic("user_group_ratio", priceData.GroupRatioInfo.GroupSpecialRatio)
+	}
+	if priceData.GroupRatioInfo.GroupPricingApplied {
+		other.SetAdmin("group_pricing", relayInfo.UsingGroup)
 	}
 	appendRequestPath(nil, relayInfo, other)
 	return other

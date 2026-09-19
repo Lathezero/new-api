@@ -50,13 +50,17 @@ import { Button } from '@/components/ui/button'
 import { useModelPricing } from '@/features/model-pricing/api'
 import {
   applyPricingDraft,
+  groupPricingEqual,
+  pricingFromDraft,
   pricingOptions,
+  type GroupPricingValues,
 } from '@/features/model-pricing/pricing'
 import { usePricingData } from '@/features/pricing/hooks/use-pricing-data'
 import { splitPluginBillingExprKey } from '@/features/pricing/lib/plugin-pricing'
 import { useMediaQuery } from '@/hooks'
 
 import { safeJsonParse } from '../utils/json-parser'
+import { GroupPricingOverridesEditor } from './group-pricing-overrides-editor'
 import type { PricingMode } from './model-pricing-core'
 import {
   ModelPricingEditorPanel,
@@ -98,6 +102,8 @@ type ModelRatioVisualEditorProps = {
   billingMode: string
   billingExpr: string
   pluginBillingExpr?: string
+  /** Draft (model → group → pricing fields) JSON map. */
+  groupModelPricing?: string
   candidateModelNames?: string[]
   candidateModelsLoading?: boolean
   filterMode?: 'all' | 'unset'
@@ -111,6 +117,8 @@ export type ModelRatioVisualEditorHandle = {
 }
 
 const STORAGE_KEY = 'model-ratio-column-visibility'
+
+const EMPTY_GROUP_PRICING: Record<string, GroupPricingValues> = {}
 
 const ModelRatioVisualEditorComponent = forwardRef<
   ModelRatioVisualEditorHandle,
@@ -139,6 +147,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
     billingMode,
     billingExpr,
     pluginBillingExpr = '{}',
+    groupModelPricing = '{}',
     candidateModelNames,
     candidateModelsLoading,
     filterMode = 'all',
@@ -158,6 +167,8 @@ const ModelRatioVisualEditorComponent = forwardRef<
     editData?.name ? [editData.name] : [],
     Boolean(editData?.name)
   )
+  const groupEditors = useRef(new Map<string, ModelPricingEditorPanelHandle>())
+  const [groupActiveGroups, setGroupActiveGroups] = useState<string[]>([])
   const [sorting, setSorting] = useState<SortingState>([])
   const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([])
   const [globalFilter, setGlobalFilter] = useState('')
@@ -219,6 +230,32 @@ const ModelRatioVisualEditorComponent = forwardRef<
       ),
     [pricingModels]
   )
+
+  // Group pricing overrides for the model currently open in the editor. The
+  // form field is the draft source of truth so committed edits survive
+  // closing and reopening the editor.
+  const groupPricingDrafts = useMemo(
+    () =>
+      safeJsonParse<Record<string, Record<string, GroupPricingValues>>>(
+        groupModelPricing,
+        { fallback: {}, silent: true }
+      ),
+    [groupModelPricing]
+  )
+  const openModelGroups = useMemo(
+    () =>
+      (editData?.name
+        ? groupPricingDrafts[editData.name]
+        : undefined) ?? EMPTY_GROUP_PRICING,
+    [groupPricingDrafts, editData?.name]
+  )
+
+  useEffect(() => {
+    groupEditors.current.clear()
+    setGroupActiveGroups(Object.keys(openModelGroups))
+    // openModelGroups identity changes only when another model opens or a
+    // save commits new group values; in-progress panel edits survive.
+  }, [openModelGroups])
 
   const models = useMemo(() => {
     const savedRows = buildModelSnapshots({
@@ -465,6 +502,11 @@ const ModelRatioVisualEditorComponent = forwardRef<
         'billing_setting.billing_expr',
         JSON.stringify(billingExprMap, null, 2)
       )
+      if (groupPricingDrafts[name]) {
+        const groupMap = { ...groupPricingDrafts }
+        delete groupMap[name]
+        onChange('GroupModelPricing', JSON.stringify(groupMap))
+      }
 
       if (editData?.name === name) {
         setEditData(null)
@@ -484,6 +526,7 @@ const ModelRatioVisualEditorComponent = forwardRef<
       billingMode,
       billingExpr,
       pluginBillingExpr,
+      groupPricingDrafts,
       onChange,
       editData,
     ]
@@ -614,13 +657,60 @@ const ModelRatioVisualEditorComponent = forwardRef<
         if (!data) return false
         persistPricingData(data)
         setEditData(data)
+
+        // Commit group pricing overrides for the open model into the
+        // form-level (model → group → fields) draft map.
+        const committedGroups: Record<string, GroupPricingValues> = {}
+        for (const group of groupActiveGroups) {
+          const groupDraft = await groupEditors.current
+            .get(group)
+            ?.commitDraft()
+          if (!groupDraft) return false
+          committedGroups[group] = pricingFromDraft(groupDraft)
+        }
+        if (!groupPricingEqual(committedGroups, openModelGroups)) {
+          const allGroups = { ...groupPricingDrafts }
+          if (Object.keys(committedGroups).length > 0) {
+            allGroups[data.name] = committedGroups
+          } else {
+            delete allGroups[data.name]
+          }
+          onChange('GroupModelPricing', JSON.stringify(allGroups))
+        }
         return true
       },
     }),
-    [editorOpen, persistPricingData]
+    [
+      editorOpen,
+      persistPricingData,
+      groupActiveGroups,
+      openModelGroups,
+      groupPricingDrafts,
+      onChange,
+    ]
   )
 
   const hasRows = table.getRowModel().rows.length > 0
+
+  const openPricingEntry = pricingConfig.data?.entries.find(
+    (entry) => entry.model_name === editData?.name
+  )
+  const groupPricingFooter = editData?.name ? (
+    <GroupPricingOverridesEditor
+      modelName={editData.name}
+      entries={openModelGroups}
+      activeGroups={groupActiveGroups}
+      onActiveGroupsChange={setGroupActiveGroups}
+      registerEditor={(group, handle) => {
+        if (handle) {
+          groupEditors.current.set(group, handle)
+        } else {
+          groupEditors.current.delete(group)
+        }
+      }}
+      usageSchema={openPricingEntry?.usage_schema}
+    />
+  ) : undefined
 
   let emptyStateText = t('No models configured. Use Add model to get started.')
   if (table.getState().globalFilter) {
@@ -743,18 +833,11 @@ const ModelRatioVisualEditorComponent = forwardRef<
             <ModelPricingEditorPanel
               ref={editorPanelRef}
               editData={editData}
-              pluginVariants={
-                pricingConfig.data?.entries.find(
-                  (entry) => entry.model_name === editData?.name
-                )?.plugin_variants
-              }
-              usageSchema={
-                pricingConfig.data?.entries.find(
-                  (entry) => entry.model_name === editData?.name
-                )?.usage_schema
-              }
+              pluginVariants={openPricingEntry?.plugin_variants}
+              usageSchema={openPricingEntry?.usage_schema}
               onSave={onSave}
               isSaving={isSaving}
+              scrollFooter={groupPricingFooter}
               className='h-full min-h-0'
             />
           ) : (
@@ -793,18 +876,11 @@ const ModelRatioVisualEditorComponent = forwardRef<
           open={sheetOpen}
           onOpenChange={setSheetOpen}
           editData={editData}
-          pluginVariants={
-            pricingConfig.data?.entries.find(
-              (entry) => entry.model_name === editData?.name
-            )?.plugin_variants
-          }
-          usageSchema={
-            pricingConfig.data?.entries.find(
-              (entry) => entry.model_name === editData?.name
-            )?.usage_schema
-          }
+          pluginVariants={openPricingEntry?.plugin_variants}
+          usageSchema={openPricingEntry?.usage_schema}
           onSave={onSave}
           isSaving={isSaving}
+          scrollFooter={groupPricingFooter}
         />
       )}
     </div>
@@ -839,6 +915,7 @@ export const ModelRatioVisualEditor = memo(
       prevProps.billingMode === nextProps.billingMode &&
       prevProps.billingExpr === nextProps.billingExpr &&
       prevProps.pluginBillingExpr === nextProps.pluginBillingExpr &&
+      prevProps.groupModelPricing === nextProps.groupModelPricing &&
       prevProps.candidateModelNames === nextProps.candidateModelNames &&
       prevProps.candidateModelsLoading === nextProps.candidateModelsLoading &&
       prevProps.filterMode === nextProps.filterMode &&

@@ -55,6 +55,21 @@ export type BillingPluginVariant = {
   billing_usage_examples?: BillingUsageExample[]
 }
 
+/** Resolved pricing for one group with a configured (model, group) override. */
+export type PricingGroupOverride = {
+  quota_type: number
+  model_ratio: number
+  completion_ratio: number
+  model_price?: number
+  cache_ratio?: number | null
+  create_cache_ratio?: number | null
+  image_ratio?: number | null
+  audio_ratio?: number | null
+  audio_completion_ratio?: number | null
+  billing_mode?: string
+  billing_expr?: string
+}
+
 export type PricingModel = {
   billing_plugin_variants?: BillingPluginVariant[]
   id: number
@@ -75,6 +90,12 @@ export type PricingModel = {
   audio_ratio?: number | null
   audio_completion_ratio?: number | null
   enable_groups: string[]
+  /**
+   * Resolved pricing for groups with a configured (model, group) override.
+   * Groups absent here use the model-level base values; the group ratio
+   * multiplier still applies on top.
+   */
+  group_pricing?: Record<string, PricingGroupOverride>
   tags?: string
   supported_endpoint_types?: string[]
   key?: string

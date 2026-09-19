@@ -472,6 +472,182 @@ func TestModelPricingConversionDatabaseMatrix(t *testing.T) {
 	}
 }
 
+func TestGroupModelPricingDatabaseMatrix(t *testing.T) {
+	const modelName = "group-pricing-matrix"
+	const priceModelName = "group-pricing-price"
+	for _, dialect := range []struct{ kind, env string }{{"sqlite", ""}, {"mysql", "TEST_MYSQL_DSN"}, {"postgres", "TEST_POSTGRES_DSN"}} {
+		t.Run(dialect.kind, func(t *testing.T) {
+			if dialect.env != "" && os.Getenv(dialect.env) == "" {
+				t.Skip("set " + dialect.env + " to run this database")
+			}
+			modelManagementDB(t, dialect.kind, os.Getenv(dialect.env))
+			previousConfigs, err := config.ConfigToMap(config.GlobalConfig.Get("billing_setting"))
+			require.NoError(t, err)
+			previousGroupPricing := previousConfigs["group_model_pricing"]
+			require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{"group_model_pricing": "{}"}))
+			t.Cleanup(func() {
+				require.NoError(t, config.UpdateConfigFromMap(config.GlobalConfig.Get("billing_setting"), map[string]string{"group_model_pricing": previousGroupPricing}))
+			})
+
+			save := func(t *testing.T, name string, pricing model.PricingValues) model.ModelPricingEntry {
+				t.Helper()
+				snapshot, err := model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				version := snapshot.EmptyVersion
+				if len(snapshot.Entries) > 0 {
+					version = snapshot.Entries[0].Version
+				}
+				require.NoError(t, model.UpdateModelPricing([]model.ModelPricingChange{
+					{ModelName: name, ExpectedVersion: version, Pricing: pricing},
+				}))
+				snapshot, err = model.GetModelPricingSnapshot([]string{name})
+				require.NoError(t, err)
+				require.Len(t, snapshot.Entries, 1)
+				return snapshot.Entries[0]
+			}
+
+			t.Run("save_resolve_and_conflict", func(t *testing.T) {
+				draft := model.PricingValues{
+					"ModelRatio": 10.0,
+					billing_setting.GroupModelPricingOption: map[string]any{
+						"vip":  map[string]any{"ModelRatio": 20.0, "CompletionRatio": 2.0},
+						"svip": map[string]any{"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `tier("svip", p * 1 + c * 1)`},
+					},
+				}
+				entry := save(t, modelName, draft)
+				assert.Equal(t, draft, entry.Configured, "configured pricing round-trips group overrides")
+				require.Contains(t, entry.Groups, "vip")
+				require.Contains(t, entry.Groups, "svip")
+				vip := entry.Groups["vip"].Effective
+				assert.Equal(t, 20.0, vip["ModelRatio"])
+				assert.Equal(t, 2.0, vip["CompletionRatio"])
+				assert.Equal(t, "ratio", vip["billing_setting.billing_mode"])
+				svip := entry.Groups["svip"].Effective
+				assert.Equal(t, "tiered_expr", svip["billing_setting.billing_mode"])
+				assert.Equal(t, `tier("svip", p * 1 + c * 1)`, svip["billing_setting.billing_expr"])
+
+				// Runtime resolution follows the saved overrides.
+				ratio, ok, _ := billing_setting.GetGroupModelRatio(modelName, "vip")
+				assert.True(t, ok)
+				assert.Equal(t, 20.0, ratio)
+				ratio, ok, _ = billing_setting.GetGroupModelRatio(modelName, "default")
+				assert.True(t, ok)
+				assert.Equal(t, 10.0, ratio, "groups without an override use the global ratio")
+				assert.Equal(t, billing_setting.BillingModeTieredExpr, billing_setting.GetGroupBillingMode(modelName, "svip"))
+				assert.Equal(t, billing_setting.BillingModeRatio, billing_setting.GetGroupBillingMode(modelName, "default"))
+
+				// Group overrides participate in the optimistic-lock version:
+				// changing one bumps the version, and replaying a stale change
+				// conflicts.
+				modified := model.PricingValues{
+					"ModelRatio": 10.0,
+					billing_setting.GroupModelPricingOption: map[string]any{
+						"vip":  map[string]any{"ModelRatio": 21.0, "CompletionRatio": 2.0},
+						"svip": map[string]any{"billing_setting.billing_mode": "tiered_expr", "billing_setting.billing_expr": `tier("svip", p * 1 + c * 1)`},
+					},
+				}
+				fresh := save(t, modelName, modified)
+				assert.NotEqual(t, entry.Version, fresh.Version)
+				assert.ErrorIs(t, model.UpdateModelPricing([]model.ModelPricingChange{
+					{ModelName: modelName, ExpectedVersion: entry.Version, Pricing: modified},
+				}), model.ErrModelPricingConflict)
+			})
+
+			t.Run("group_ratio_suppresses_global_price", func(t *testing.T) {
+				entry := save(t, priceModelName, model.PricingValues{
+					"ModelPrice": 1.5,
+					billing_setting.GroupModelPricingOption: map[string]any{
+						"vip": map[string]any{"ModelRatio": 25.0},
+					},
+				})
+				vip := entry.Groups["vip"].Effective
+				_, hasPrice := vip["ModelPrice"]
+				assert.False(t, hasPrice, "group ratio override suppresses the global fixed price")
+				assert.Equal(t, 25.0, vip["ModelRatio"])
+
+				_, usePrice := billing_setting.GetGroupModelPrice(priceModelName, "vip", false)
+				assert.False(t, usePrice)
+				price, usePrice := billing_setting.GetGroupModelPrice(priceModelName, "default", false)
+				assert.True(t, usePrice)
+				assert.Equal(t, 1.5, price, "groups without an override keep the global fixed price")
+			})
+
+			t.Run("stale_group_expr_survives_plugin_removal", func(t *testing.T) {
+				_, err := jsplugin.DefaultRegistry.Register(`
+export const meta = {apiVersion: 1, key: "group-pricing-task-plugin", name: "Group pricing task fixture", version: "1.0.0", author: {name: "Test"}, models: ["group-pricing-task"], fetchMode: "per_task", usageSchema: {seconds: {type: "number", unit: "second"}}};
+export function buildSubmitRequest() { return {}; }
+export function parseSubmitResponse() { return {}; }
+export function buildQueryRequest() { return {}; }
+export function parseTaskResult() { return {}; }
+`, jsplugin.Options{})
+				require.NoError(t, err)
+				t.Cleanup(func() { jsplugin.DefaultRegistry.Unregister("group-pricing-task-plugin") })
+
+				groupEntry := map[string]any{
+					"billing_setting.billing_mode": "tiered_expr",
+					"billing_setting.billing_expr": `tier("base", u("seconds") * 0.4)`,
+				}
+				save(t, "group-pricing-task", model.PricingValues{
+					billing_setting.GroupModelPricingOption: map[string]any{"vip": groupEntry},
+				})
+
+				// Once the plugin is gone there is no usage schema to smoke test
+				// against; the unchanged stored expression must not block saves.
+				jsplugin.DefaultRegistry.Unregister("group-pricing-task-plugin")
+				save(t, "group-pricing-task", model.PricingValues{
+					"ModelRatio": 5.0,
+					billing_setting.GroupModelPricingOption: map[string]any{
+						"vip": groupEntry,
+					},
+				})
+				// Changing another field while keeping the expression unchanged
+				// must also survive.
+				changed := map[string]any{
+					"billing_setting.billing_mode": "tiered_expr",
+					"billing_setting.billing_expr": `tier("base", u("seconds") * 0.4)`,
+					"CompletionRatio":              2.0,
+				}
+				entry := save(t, "group-pricing-task", model.PricingValues{
+					"ModelRatio": 5.0,
+					billing_setting.GroupModelPricingOption: map[string]any{
+						"vip": changed,
+					},
+				})
+				assert.Equal(t, 2.0, entry.Groups["vip"].Configured["CompletionRatio"])
+			})
+
+			t.Run("validation", func(t *testing.T) {
+				snapshot, err := model.GetModelPricingSnapshot([]string{modelName})
+				require.NoError(t, err)
+				version := snapshot.Entries[0].Version
+				for _, tc := range []struct {
+					name    string
+					groups  map[string]any
+					message string
+				}{
+					{"unknown_group", map[string]any{"no-such-group-xyz": map[string]any{"ModelRatio": 1.0}}, "not an available group"},
+					{"unsupported_field", map[string]any{"vip": map[string]any{"Foo": 1.0}}, "unsupported pricing field"},
+					{"negative_number", map[string]any{"vip": map[string]any{"ModelRatio": -1.0}}, "non-negative"},
+					{"empty_entry", map[string]any{"vip": map[string]any{}}, "non-empty object"},
+					{"invalid_mode", map[string]any{"vip": map[string]any{"billing_setting.billing_mode": "weird"}}, "invalid billing mode"},
+					{"broken_expr", map[string]any{"vip": map[string]any{"billing_setting.billing_expr": "tier("}}, "group vip"},
+					{"tiered_without_expr", map[string]any{"vip": map[string]any{"billing_setting.billing_mode": "tiered_expr"}}, "requires an expression"},
+				} {
+					t.Run(tc.name, func(t *testing.T) {
+						err := model.UpdateModelPricing([]model.ModelPricingChange{{
+							ModelName:       modelName,
+							ExpectedVersion: version,
+							Pricing:         model.PricingValues{"ModelRatio": 10.0, billing_setting.GroupModelPricingOption: tc.groups},
+						}})
+						require.Error(t, err)
+						assert.Contains(t, err.Error(), tc.message)
+					})
+				}
+			})
+		})
+	}
+}
+
 func TestModelManagementDatabaseMatrix(t *testing.T) {
 	_, err := jsplugin.DefaultRegistry.Register(`
 export const meta = {apiVersion: 1, key: "model-management-task", name: "Management task fixture", version: "1.0.0", author: {name: "Test"}, models: ["matrix-task"], fetchMode: "per_task", usageSchema: {seconds: {type: "number", unit: "second"}}};

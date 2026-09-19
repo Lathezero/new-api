@@ -124,6 +124,7 @@ type ModelPricingSheetProps = {
   usageSchema?: BillingUsageSchema
   pluginVariants?: ModelPricingPluginVariant[]
   onDirtyChange?: (dirty: boolean) => void
+  scrollFooter?: ReactNode
 }
 
 type ModelPricingEditorPanelProps = Omit<
@@ -133,6 +134,7 @@ type ModelPricingEditorPanelProps = Omit<
   className?: string
   embedded?: boolean
   scrollHeader?: ReactNode
+  scrollFooter?: ReactNode
 }
 
 export type ModelPricingEditorPanelHandle = {
@@ -154,6 +156,7 @@ export const ModelPricingSheet = forwardRef<
     usageSchema,
     pluginVariants,
     onDirtyChange,
+    scrollFooter,
   },
   ref
 ) {
@@ -179,6 +182,7 @@ export const ModelPricingSheet = forwardRef<
           onDirtyChange={onDirtyChange}
           onSave={onSave}
           isSaving={isSaving}
+          scrollFooter={scrollFooter}
           className='h-full rounded-none border-0'
         />
       </SheetContent>
@@ -200,6 +204,7 @@ export const ModelPricingEditorPanel = forwardRef<
     onDirtyChange,
     embedded = false,
     scrollHeader,
+    scrollFooter,
   },
   ref
 ) {
@@ -1183,6 +1188,7 @@ export const ModelPricingEditorPanel = forwardRef<
                 </div>
               </aside>
             </div>
+            {scrollFooter && <div className='mt-4'>{scrollFooter}</div>}
           </div>
           {showActions && (
             <div className='bg-background/95 supports-[backdrop-filter]:bg-background/80 shrink-0 border-t p-3 backdrop-blur'>

@@ -28,17 +28,19 @@ const (
 
 // BillingSetting is managed by config.GlobalConfig.Register.
 // DB keys: billing_setting.billing_mode, billing_setting.billing_expr,
-// billing_setting.plugin_billing_expr
+// billing_setting.plugin_billing_expr, billing_setting.group_model_pricing
 type BillingSetting struct {
-	BillingMode       map[string]string `json:"billing_mode"`
-	BillingExpr       map[string]string `json:"billing_expr"`
-	PluginBillingExpr map[string]string `json:"plugin_billing_expr"`
+	BillingMode       map[string]string                  `json:"billing_mode"`
+	BillingExpr       map[string]string                  `json:"billing_expr"`
+	PluginBillingExpr map[string]string                  `json:"plugin_billing_expr"`
+	GroupModelPricing map[string]map[string]GroupPricing `json:"group_model_pricing"`
 }
 
 var billingSetting = BillingSetting{
 	BillingMode:       make(map[string]string),
 	BillingExpr:       make(map[string]string),
 	PluginBillingExpr: make(map[string]string),
+	GroupModelPricing: make(map[string]map[string]GroupPricing),
 }
 
 func init() {
@@ -172,12 +174,15 @@ func GetBillingExprCopy() map[string]string {
 }
 
 func GetPricingSyncData(base map[string]any) map[string]any {
-	extra := make(map[string]any, 2)
+	extra := make(map[string]any, 3)
 	if modes := GetBillingModeCopy(); len(modes) > 0 {
 		extra[BillingModeField] = modes
 	}
 	if exprs := GetBillingExprCopy(); len(exprs) > 0 {
 		extra[BillingExprField] = exprs
+	}
+	if groupPricing := GetGroupModelPricingCopy(); len(groupPricing) > 0 {
+		extra["group_model_pricing"] = groupPricing
 	}
 	return lo.Assign(base, extra)
 }

@@ -27,6 +27,7 @@ import { Button } from '@/components/ui/button'
 import { DynamicPricingBreakdown } from '@/features/pricing/components/dynamic-pricing-breakdown'
 import { ModelPriceCell } from '@/features/pricing/components/model-price-cell'
 import { isDynamicPricingModel } from '@/features/pricing/lib/dynamic-price'
+import { GroupPricingOverridesEditor } from '@/features/system-settings/models/group-pricing-overrides-editor'
 import {
   buildPreviewRows,
   createInitialLaneState,
@@ -50,7 +51,14 @@ import {
   isValidPricingCurrency,
   USD_PRICING_CURRENCY,
 } from './currency'
-import { modelPricingDisplay, pricingFromDraft, pricingRow } from './pricing'
+import {
+  GROUP_MODEL_PRICING_KEY,
+  modelPricingDisplay,
+  pricingFromDraft,
+  pricingRow,
+  type GroupPricingValues,
+  type PricingValues,
+} from './pricing'
 
 export function ModelPricingPanel(props: {
   modelName: string
@@ -67,6 +75,10 @@ export function ModelPricingPanel(props: {
   const [entry, setEntry] = useState<ModelPricingEntry | null>(null)
   const [resetOpen, setResetOpen] = useState(false)
   const editor = useRef<ModelPricingEditorPanelHandle>(null)
+  const groupEditors = useRef(new Map<string, ModelPricingEditorPanelHandle>())
+  const [activeGroups, setActiveGroups] = useState<string[]>([])
+  const [groupMembershipDirty, setGroupMembershipDirty] = useState(false)
+  const [groupPanelsDirty, setGroupPanelsDirty] = useState(false)
   const editData = useMemo(() => {
     if (!entry) return null
     const values = { ...entry.configured }
@@ -87,16 +99,54 @@ export function ModelPricingPanel(props: {
     }
   }, [query.data, entry, props.modelName])
 
+  // entry identity changes only when a different model loads or a save
+  // completes, so this reinitializes group drafts exactly then.
+  useEffect(() => {
+    setActiveGroups(Object.keys(entry?.groups ?? {}))
+    setGroupMembershipDirty(false)
+    setGroupPanelsDirty(false)
+  }, [entry])
+
+  const groupEntries = useMemo(() => {
+    const result: Record<string, PricingValues> = {}
+    for (const [group, groupEntry] of Object.entries(entry?.groups ?? {})) {
+      result[group] = groupEntry.configured
+    }
+    return result
+  }, [entry])
+
+  const [editorDirty, setEditorDirty] = useState(false)
+  const onDirtyChange = props.onDirtyChange
+  useEffect(() => {
+    onDirtyChange?.(editorDirty || groupMembershipDirty || groupPanelsDirty)
+  }, [editorDirty, groupMembershipDirty, groupPanelsDirty, onDirtyChange])
+
   const persist = async (reset = false) => {
     if (!entry) return
     try {
       const draft = reset ? null : await editor.current?.commitDraft()
       if (!reset && !draft) return
+      const pricing = draft ? pricingFromDraft(draft) : {}
+      if (!reset) {
+        const hadGroupPricing =
+          entry.configured[GROUP_MODEL_PRICING_KEY] !== undefined
+        if (activeGroups.length > 0 || hadGroupPricing) {
+          const groupPricing: Record<string, GroupPricingValues> = {}
+          for (const group of activeGroups) {
+            const groupDraft = await groupEditors.current
+              .get(group)
+              ?.commitDraft()
+            if (!groupDraft) return
+            groupPricing[group] = pricingFromDraft(groupDraft)
+          }
+          pricing[GROUP_MODEL_PRICING_KEY] = groupPricing
+        }
+      }
       await save.mutateAsync([
         {
           model_name: entry.model_name,
           expected_version: entry.version,
-          pricing: draft ? pricingFromDraft(draft) : {},
+          pricing,
           reset,
         },
       ])
@@ -165,10 +215,30 @@ export function ModelPricingPanel(props: {
         editData={editData}
         usageSchema={entry.usage_schema}
         pluginVariants={entry.plugin_variants}
-        onDirtyChange={props.onDirtyChange}
+        onDirtyChange={setEditorDirty}
         onSave={() => persist()}
         isSaving={save.isPending}
         className='rounded-none border-0'
+        scrollFooter={
+          <GroupPricingOverridesEditor
+            modelName={entry.model_name}
+            entries={groupEntries}
+            activeGroups={activeGroups}
+            onActiveGroupsChange={(groups) => {
+              setActiveGroups(groups)
+              setGroupMembershipDirty(true)
+            }}
+            registerEditor={(group, handle) => {
+              if (handle) {
+                groupEditors.current.set(group, handle)
+              } else {
+                groupEditors.current.delete(group)
+              }
+            }}
+            usageSchema={entry.usage_schema}
+            onDirtyChange={setGroupPanelsDirty}
+          />
+        }
         scrollHeader={
           <>
             <div className='flex flex-wrap items-center justify-between gap-2'>

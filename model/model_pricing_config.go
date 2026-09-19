@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -32,12 +33,21 @@ type ModelPricingChange struct {
 	Reset           bool          `json:"reset,omitempty"`
 }
 
+// ModelPricingGroupEntry is one group's pricing override for a model:
+// the raw configured values and the effective view after overlaying them on
+// the model's global pricing.
+type ModelPricingGroupEntry struct {
+	Configured PricingValues `json:"configured"`
+	Effective  PricingValues `json:"effective"`
+}
+
 type ModelPricingEntry struct {
 	ModelPricingDescription
 	PluginVariants []ModelPricingPluginVariant          `json:"plugin_variants,omitempty"`
 	ModelName      string                               `json:"model_name"`
 	Version        string                               `json:"version"`
 	Configured     PricingValues                        `json:"configured"`
+	Groups         map[string]ModelPricingGroupEntry    `json:"groups,omitempty"`
 	UsageSchema    map[string]jsplugin.UsageFieldSchema `json:"usage_schema,omitempty"`
 }
 
@@ -67,6 +77,7 @@ var modelPricingOptionKeys = []string{
 	"AudioCompletionRatio", "AudioRatio", "CacheRatio", "CompletionRatio",
 	"CreateCacheRatio", "ImageRatio", "ModelPrice", "ModelRatio",
 	"billing_setting.billing_expr", "billing_setting.billing_mode", billing_setting.PluginBillingExprOption,
+	billing_setting.GroupModelPricingOption,
 }
 
 var modelPricingMutationMu sync.Mutex
@@ -169,6 +180,9 @@ func replaceModelPricing(values map[string]map[string]any, name string, draft Pr
 
 func effectiveModelPricing(values map[string]map[string]any, name string) PricingValues {
 	result := modelPricingValues(values, name)
+	// Group overrides resolve separately per group; they are not part of the
+	// model-level effective view.
+	delete(result, billing_setting.GroupModelPricingOption)
 	// Legacy wildcard aliases are resolved by the same normalization as relay.
 	alias := ratio_setting.FormatMatchingModelName(name)
 	for _, key := range []string{"ModelPrice", "ModelRatio", "CompletionRatio", "AudioRatio", "AudioCompletionRatio"} {
@@ -214,6 +228,46 @@ func effectiveModelPricing(values map[string]map[string]any, name string) Pricin
 	} {
 		if _, exists := result[key]; !exists {
 			result[key] = fallback
+		}
+	}
+	return result
+}
+
+// effectiveGroupModelPricing overlays one group override on the model's
+// effective pricing, mirroring the relay-time resolution in billing_setting:
+// explicit mode wins, then field inference, then the global mode; a group
+// ratio override suppresses a global fixed price.
+func effectiveGroupModelPricing(name string, globalEffective PricingValues, entry map[string]any) PricingValues {
+	result := maps.Clone(globalEffective)
+	for key, value := range entry {
+		result[key] = value
+	}
+	mode, _ := entry["billing_setting.billing_mode"].(string)
+	if mode == "" {
+		if _, hasExpr := entry["billing_setting.billing_expr"]; hasExpr {
+			mode = billing_setting.BillingModeTieredExpr
+		} else if _, hasPrice := entry["ModelPrice"]; hasPrice {
+			mode = billing_setting.BillingModeRatio
+		} else if _, hasRatio := entry["ModelRatio"]; hasRatio {
+			mode = billing_setting.BillingModeRatio
+		} else {
+			mode, _ = globalEffective["billing_setting.billing_mode"].(string)
+		}
+	}
+	if mode == billing_setting.BillingModeTieredExpr {
+		result["billing_setting.billing_mode"] = billing_setting.BillingModeTieredExpr
+		if _, hasExpr := entry["billing_setting.billing_expr"]; !hasExpr {
+			if expression, ok := billing_setting.GetBillingExpr(name); ok {
+				result["billing_setting.billing_expr"] = expression
+			}
+		}
+		return result
+	}
+	result["billing_setting.billing_mode"] = billing_setting.BillingModeRatio
+	delete(result, "billing_setting.billing_expr")
+	if _, hasRatio := entry["ModelRatio"]; hasRatio {
+		if _, hasPrice := entry["ModelPrice"]; !hasPrice {
+			delete(result, "ModelPrice")
 		}
 	}
 	return result
@@ -269,6 +323,16 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 		configured := modelPricingValues(values, name)
 		entry := ModelPricingEntry{ModelName: name, Version: ModelPricingVersion(configured), Configured: configured,
 			ModelPricingDescription: ModelPricingDescription{Effective: effectiveModelPricing(values, name)}}
+		if rawGroups, ok := configured[billing_setting.GroupModelPricingOption].(map[string]any); ok {
+			entry.Groups = make(map[string]ModelPricingGroupEntry, len(rawGroups))
+			for group, rawEntry := range rawGroups {
+				groupValues, _ := rawEntry.(map[string]any)
+				entry.Groups[group] = ModelPricingGroupEntry{
+					Configured: PricingValues(groupValues),
+					Effective:  effectiveGroupModelPricing(name, entry.Effective, groupValues),
+				}
+			}
+		}
 		entry.CacheWriteMode = ResolveCacheWriteMode(name, configured)
 		entry.BillingDetails = ResolveLegacyBillingDetails(name, entry.Effective, configured)
 		if plugin, ok := generation.GetByModel(name); ok {
@@ -392,7 +456,7 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 		}
 	}
 	for key, value := range values {
-		if key == billing_setting.PluginBillingExprOption {
+		if key == billing_setting.PluginBillingExprOption || key == billing_setting.GroupModelPricingOption {
 			continue
 		}
 		if !IsModelPricingOption(key) {
@@ -409,37 +473,9 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 			if !ok || strings.TrimSpace(expression) == "" {
 				return errors.New("billing expression is required")
 			}
-			// Even a model expression currently shadowed by every provider must
-			// compile; only its schema-specific smoke tests can be skipped.
-			if _, err := billingexpr.CompileFromCache(expression); err != nil {
-				return fmt.Errorf("model %s: %w", name, err)
-			}
-			var err error
-			if plugins := generation.PluginsByModel(name); len(plugins) > 0 {
-				for _, plugin := range plugins {
-					if _, overridden := variants[plugin.Meta.Key]; overridden {
-						continue
-					}
-					schema, _ := plugin.Meta.UsageForModel(name)
-					if err = billing_setting.SmokeTestTaskExpr(expression, schema); err != nil {
-						return fmt.Errorf("model %s: plugin %s: %w", name, plugin.Meta.Key, err)
-					}
-				}
-			} else if target, resolved := ResolveTaskModelAlias(generation, name); resolved {
-				if plugin, ok := generation.Get(target.PluginKey); ok {
-					schema, _ := plugin.Meta.UsageForModel(target.Declared)
-					err = billing_setting.SmokeTestTaskExpr(expression, schema)
-				} else {
-					err = billing_setting.SmokeTestExpr(expression)
-				}
-			} else if previous[key] != expression || len(billingexpr.UsedUsageKeys(expression)) == 0 {
-				err = billing_setting.SmokeTestExpr(expression)
-			}
-			// With no remaining plugin, an unchanged stored usage expression has
-			// no schema to test. Preserve it so removing stale overrides or saving
-			// other model prices does not become impossible.
-			if err != nil {
-				return fmt.Errorf("model %s: %w", name, err)
+			previousExpression, _ := previous[key].(string)
+			if err := smokeTestModelBillingExpr(name, expression, previousExpression, variants); err != nil {
+				return err
 			}
 			continue
 		}
@@ -455,7 +491,159 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 			}
 		}
 	}
+	return validateGroupModelPricing(name, values, previous, variants)
+}
+
+// smokeTestModelBillingExpr compiles a billing expression and runs the
+// schema-aware smoke tests. An unchanged stored usage expression whose plugin
+// is gone has no schema to test; preserve it so removing stale overrides or
+// saving other model prices does not become impossible.
+func smokeTestModelBillingExpr(name, expression, previousExpression string, variants map[string]any) error {
+	// Even a model expression currently shadowed by every provider must
+	// compile; only its schema-specific smoke tests can be skipped.
+	if _, err := billingexpr.CompileFromCache(expression); err != nil {
+		return fmt.Errorf("model %s: %w", name, err)
+	}
+	generation := jsplugin.DefaultRegistry.Generation()
+	var err error
+	if plugins := generation.PluginsByModel(name); len(plugins) > 0 {
+		for _, plugin := range plugins {
+			if _, overridden := variants[plugin.Meta.Key]; overridden {
+				continue
+			}
+			schema, _ := plugin.Meta.UsageForModel(name)
+			if err = billing_setting.SmokeTestTaskExpr(expression, schema); err != nil {
+				return fmt.Errorf("model %s: plugin %s: %w", name, plugin.Meta.Key, err)
+			}
+		}
+	} else if target, resolved := ResolveTaskModelAlias(generation, name); resolved {
+		if plugin, ok := generation.Get(target.PluginKey); ok {
+			schema, _ := plugin.Meta.UsageForModel(target.Declared)
+			err = billing_setting.SmokeTestTaskExpr(expression, schema)
+		} else {
+			err = billing_setting.SmokeTestExpr(expression)
+		}
+	} else if previousExpression != expression || len(billingexpr.UsedUsageKeys(expression)) == 0 {
+		err = billing_setting.SmokeTestExpr(expression)
+	}
+	if err != nil {
+		return fmt.Errorf("model %s: %w", name, err)
+	}
 	return nil
+}
+
+// groupPricingFieldKeys are the PricingValues keys a group override may set.
+var groupPricingFieldKeys = []string{
+	"billing_setting.billing_mode", "billing_setting.billing_expr",
+	"ModelPrice", "ModelRatio", "CompletionRatio", "CacheRatio",
+	"CreateCacheRatio", "ImageRatio", "AudioRatio", "AudioCompletionRatio",
+}
+
+// validateGroupModelPricing validates every group override in a model draft.
+// Unchanged entries skip validation entirely, so stale overrides keep working
+// when their group disappears or their task plugin is removed, mirroring the
+// plugin-variant stale exemption.
+func validateGroupModelPricing(name string, values, previous PricingValues, variants map[string]any) error {
+	raw, exists := values[billing_setting.GroupModelPricingOption]
+	if !exists {
+		return nil
+	}
+	groups, ok := raw.(map[string]any)
+	if !ok || groups == nil {
+		return errors.New("group model pricing must be a group-to-pricing object")
+	}
+	previousGroups, _ := previous[billing_setting.GroupModelPricingOption].(map[string]any)
+	for group, rawEntry := range groups {
+		if strings.TrimSpace(group) == "" {
+			return fmt.Errorf("model %s: group name is required", name)
+		}
+		entry, ok := rawEntry.(map[string]any)
+		if !ok || len(entry) == 0 {
+			return fmt.Errorf("model %s: group %s: pricing override must be a non-empty object", name, group)
+		}
+		var previousEntry map[string]any
+		if previousGroups != nil {
+			previousEntry, _ = previousGroups[group].(map[string]any)
+		}
+		if reflect.DeepEqual(previousEntry, entry) {
+			continue
+		}
+		if err := validateGroupPricingEntry(name, group, entry, previousEntry, variants); err != nil {
+			return err
+		}
+		if !groupPricingGroupExists(name, group) {
+			return fmt.Errorf("model %s: group %s is not an available group for this model", name, group)
+		}
+	}
+	return nil
+}
+
+func validateGroupPricingEntry(name, group string, entry, previousEntry map[string]any, variants map[string]any) error {
+	for key, value := range entry {
+		if !slices.Contains(groupPricingFieldKeys, key) {
+			return fmt.Errorf("model %s: group %s: unsupported pricing field: %s", name, group, key)
+		}
+		switch key {
+		case "billing_setting.billing_mode":
+			if value != "ratio" && value != "tiered_expr" {
+				return fmt.Errorf("model %s: group %s: invalid billing mode", name, group)
+			}
+		case "billing_setting.billing_expr":
+			expression, ok := value.(string)
+			if !ok || strings.TrimSpace(expression) == "" {
+				return fmt.Errorf("model %s: group %s: billing expression is required", name, group)
+			}
+			// An unchanged stored usage expression whose plugin is gone has no
+			// schema to test; preserve it like the model-level expression.
+			previousExpression, _ := previousEntry["billing_setting.billing_expr"].(string)
+			if err := smokeTestModelBillingExpr(name, expression, previousExpression, variants); err != nil {
+				return fmt.Errorf("model %s: group %s: %w", name, group, err)
+			}
+		default:
+			number, ok := value.(float64)
+			if !ok || math.IsNaN(number) || math.IsInf(number, 0) || number < 0 {
+				return fmt.Errorf("model %s: group %s: %s must be a finite, non-negative number", name, group, key)
+			}
+		}
+	}
+	// A group override must leave the group with a billable configuration:
+	// its own fields or the model's global configuration must provide one.
+	mode, _ := entry["billing_setting.billing_mode"].(string)
+	_, hasExpr := entry["billing_setting.billing_expr"]
+	_, hasPrice := entry["ModelPrice"]
+	_, hasRatio := entry["ModelRatio"]
+	if mode == "" {
+		if hasExpr {
+			mode = billing_setting.BillingModeTieredExpr
+		} else if hasPrice || hasRatio {
+			mode = billing_setting.BillingModeRatio
+		}
+	}
+	if mode == billing_setting.BillingModeTieredExpr && !hasExpr {
+		if _, fallback := billing_setting.GetBillingExpr(name); !fallback {
+			return fmt.Errorf("model %s: group %s: tiered_expr billing requires an expression here or in the model pricing", name, group)
+		}
+	}
+	if mode == billing_setting.BillingModeRatio && !hasPrice && !hasRatio {
+		_, globalPrice := ratio_setting.GetModelPrice(name, false)
+		if !globalPrice && !ratio_setting.HasConfiguredModelRatio(name) {
+			return fmt.Errorf("model %s: group %s: ratio billing requires a price or ratio here or in the model pricing", name, group)
+		}
+	}
+	return nil
+}
+
+// groupPricingGroupExists reports whether group can serve the model: it is
+// enabled for the model through channel abilities or defined in group ratio
+// settings (which lets administrators pre-configure pricing before a channel
+// offers the model to that group).
+func groupPricingGroupExists(name, group string) bool {
+	if ratio_setting.ContainsGroupRatio(group) {
+		return true
+	}
+	modelEnableGroupsLock.RLock()
+	defer modelEnableGroupsLock.RUnlock()
+	return slices.Contains(modelEnableGroups[name], group)
 }
 
 func UpdateModelPricing(changes []ModelPricingChange) error {

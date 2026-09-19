@@ -11,6 +11,9 @@ type GroupRatioInfo struct {
 	GroupRatio        float64
 	GroupSpecialRatio float64
 	HasSpecialRatio   bool
+	// GroupPricingApplied marks that a (model, group) pricing override
+	// participated in pricing this request; recorded in admin-only log info.
+	GroupPricingApplied bool
 }
 
 type PriceData struct {
