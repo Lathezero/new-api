@@ -30,7 +30,10 @@ import {
   getDynamicPricingSummary,
   isUnconfiguredTaskUsageModel,
 } from '../lib/dynamic-price'
-import { isTokenBasedModel } from '../lib/model-helpers'
+import {
+  isTokenBasedModel,
+  resolveGroupPricingModel,
+} from '../lib/model-helpers'
 import { formatPrice, formatRequestPrice } from '../lib/price'
 import { taskUsageUnitLabel } from '../lib/task-price-display'
 import type { PricingModel, TokenUnit } from '../types'
@@ -55,10 +58,17 @@ export function ModelPriceCell(props: {
   const options = props.options ?? {}
   const tokenUnit = options.tokenUnit ?? DEFAULT_TOKEN_UNIT
   const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
-  const billingTime = useBillingTime(props.model.billing_expr)
+  // Show the selected group's override pricing when configured; the group
+  // ratio multiplier still applies on top.
+  const displayModel = useMemo(
+    () => resolveGroupPricingModel(props.model, options.selectedGroup),
+    [props.model, options.selectedGroup]
+  )
+  const hasGroupOverride = displayModel !== props.model
+  const billingTime = useBillingTime(displayModel.billing_expr)
   const dynamic = useMemo(
     () =>
-      getDynamicPricingSummary(props.model, {
+      getDynamicPricingSummary(displayModel, {
         priceRate: options.priceRate,
         usdExchangeRate: options.usdExchangeRate,
         showRechargePrice: options.showRechargePrice,
@@ -66,14 +76,14 @@ export function ModelPriceCell(props: {
         tokenUnit,
         showCurrencySymbol: false,
         groupRatioMultiplier: getDynamicDisplayGroupRatio(
-          props.model,
+          displayModel,
           options.selectedGroup
         ),
       }),
     // Currency is read indirectly by the price formatter.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
-      props.model,
+      displayModel,
       tokenUnit,
       options.priceRate,
       options.usdExchangeRate,
@@ -168,17 +178,19 @@ export function ModelPriceCell(props: {
       caption += ` · ${t('{{count}} tiers', { count: dynamic.tierCount })}`
     }
   } else {
-    if (isUnconfiguredTaskUsageModel(props.model)) {
+    // A group override is explicit pricing for the group even when the base
+    // usage-based model has no configured price of its own.
+    if (!hasGroupOverride && isUnconfiguredTaskUsageModel(displayModel)) {
       return (
         <span className='text-muted-foreground text-sm'>
           {t('Not configured')}
         </span>
       )
     }
-    const tokenBased = isTokenBasedModel(props.model)
+    const tokenBased = isTokenBasedModel(displayModel)
     if (
       !Number.isFinite(
-        tokenBased ? props.model.model_ratio : props.model.model_price
+        tokenBased ? displayModel.model_ratio : displayModel.model_price
       )
     ) {
       return (
@@ -192,7 +204,7 @@ export function ModelPriceCell(props: {
         {
           label: t('Input'),
           value: formatPrice(
-            props.model,
+            displayModel,
             'input',
             tokenUnit,
             options.showRechargePrice,
@@ -205,7 +217,7 @@ export function ModelPriceCell(props: {
         {
           label: t('Output'),
           value: formatPrice(
-            props.model,
+            displayModel,
             'output',
             tokenUnit,
             options.showRechargePrice,
@@ -221,7 +233,7 @@ export function ModelPriceCell(props: {
         {
           label: t('Per-request'),
           value: formatRequestPrice(
-            props.model,
+            displayModel,
             options.showRechargePrice,
             options.priceRate,
             options.usdExchangeRate,

@@ -28,7 +28,10 @@ import {
   getDynamicPricingSummary,
   isUnconfiguredTaskUsageModel,
 } from '../lib/dynamic-price'
-import { isTokenBasedModel } from '../lib/model-helpers'
+import {
+  isTokenBasedModel,
+  resolveGroupPricingModel,
+} from '../lib/model-helpers'
 import { formatPrice, stripTrailingZeros } from '../lib/price'
 import type { PricingModel } from '../types'
 import type { ModelPriceCellOptions } from './model-price-cell'
@@ -48,7 +51,13 @@ export function CachedPriceCell(props: {
 
   const tokenUnitLabel = tokenUnit === 'K' ? '1K' : '1M'
 
-  const model = props.model
+  // Show the selected group's override pricing when configured; the group
+  // ratio multiplier still applies on top.
+  const model = useMemo(
+    () => resolveGroupPricingModel(props.model, selectedGroup),
+    [props.model, selectedGroup]
+  )
+  const hasGroupOverride = model !== props.model
   const currency = useSystemConfigStore((state) => state.config.currency)
   const billingTime = useBillingTime(model.billing_expr)
   const dynamicSummary = useMemo(
@@ -118,7 +127,9 @@ export function CachedPriceCell(props: {
     )
   }
 
-  if (isUnconfiguredTaskUsageModel(model)) {
+  // A group override is explicit pricing for the group even when the base
+  // usage-based model has no configured price of its own.
+  if (!hasGroupOverride && isUnconfiguredTaskUsageModel(model)) {
     return <span className='text-muted-foreground/30 text-xs'>—</span>
   }
 
