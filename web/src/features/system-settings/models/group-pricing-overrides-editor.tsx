@@ -31,7 +31,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { pricingRow, type PricingValues } from '@/features/model-pricing/pricing'
+import {
+  pricingRow,
+  type PricingValues,
+} from '@/features/model-pricing/pricing'
 import type { BillingUsageSchema } from '@/features/pricing/types'
 import { getGroups } from '@/features/users/api'
 
@@ -52,6 +55,56 @@ export type GroupPricingOverridesEditorProps = {
   ) => void
   usageSchema?: BillingUsageSchema
   onDirtyChange?: (dirty: boolean) => void
+}
+
+function GroupOverridePanel(props: {
+  modelName: string
+  group: string
+  configured?: PricingValues
+  usageSchema?: BillingUsageSchema
+  registerEditor: (
+    group: string,
+    handle: ModelPricingEditorPanelHandle | null
+  ) => void
+  onDirtyChange: (dirty: boolean) => void
+  onRemove: () => void
+}) {
+  const { t } = useTranslation()
+  // editData must keep a stable identity across parent re-renders: the editor
+  // panel resets its draft whenever editData changes identity, and computing
+  // it inline wiped in-progress edits on every dirty-report re-render.
+  const editData = useMemo(
+    () =>
+      props.configured && Object.keys(props.configured).length > 0
+        ? pricingRow(props.modelName, props.configured)
+        : { name: props.modelName },
+    [props.modelName, props.configured]
+  )
+  return (
+    <div className='overflow-hidden rounded-lg border'>
+      <div className='bg-muted/20 flex items-center justify-between gap-3 border-b px-3 py-2'>
+        <GroupBadge group={props.group} size='sm' />
+        <Button
+          type='button'
+          variant='ghost'
+          size='sm'
+          aria-label={t('Remove group pricing override')}
+          onClick={props.onRemove}
+        >
+          <Trash2 data-icon='inline-start' />
+          {t('Remove')}
+        </Button>
+      </div>
+      <ModelPricingEditorPanel
+        embedded
+        ref={(handle) => props.registerEditor(props.group, handle)}
+        editData={editData}
+        usageSchema={props.usageSchema}
+        onDirtyChange={props.onDirtyChange}
+        className='rounded-none border-0'
+      />
+    </div>
+  )
 }
 
 export function GroupPricingOverridesEditor(
@@ -102,42 +155,25 @@ export function GroupPricingOverridesEditor(
         </p>
       </div>
 
-      {props.activeGroups.map((group) => {
-        const configured = props.entries[group]
-        const editData =
-          configured && Object.keys(configured).length > 0
-            ? pricingRow(props.modelName, configured)
-            : { name: props.modelName }
-        return (
-          <div key={group} className='overflow-hidden rounded-lg border'>
-            <div className='bg-muted/20 flex items-center justify-between gap-3 border-b px-3 py-2'>
-              <GroupBadge group={group} size='sm' />
-              <Button
-                type='button'
-                variant='ghost'
-                size='sm'
-                aria-label={t('Remove group pricing override')}
-                onClick={() => setGroupToRemove(group)}
-              >
-                <Trash2 data-icon='inline-start' />
-                {t('Remove')}
-              </Button>
-            </div>
-            <ModelPricingEditorPanel
-              embedded
-              ref={(handle) => props.registerEditor(group, handle)}
-              editData={editData}
-              usageSchema={props.usageSchema}
-              onDirtyChange={(dirty) => reportDirty(group, dirty)}
-              className='rounded-none border-0'
-            />
-          </div>
-        )
-      })}
+      {props.activeGroups.map((group) => (
+        <GroupOverridePanel
+          key={group}
+          modelName={props.modelName}
+          group={group}
+          configured={props.entries[group]}
+          usageSchema={props.usageSchema}
+          registerEditor={props.registerEditor}
+          onDirtyChange={(dirty) => reportDirty(group, dirty)}
+          onRemove={() => setGroupToRemove(group)}
+        />
+      ))}
 
       <div className='flex flex-wrap items-center gap-2'>
         <Select
-          items={candidateGroups.map((group) => ({ value: group, label: group }))}
+          items={candidateGroups.map((group) => ({
+            value: group,
+            label: group,
+          }))}
           value={groupToAdd}
           onValueChange={(value) => setGroupToAdd(value ?? '')}
         >
