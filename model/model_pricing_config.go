@@ -344,7 +344,7 @@ func GetModelPricingSnapshot(names []string) (*ModelPricingSnapshot, error) {
 		}
 		plugins := generation.PluginsByModel(name)
 		configuredVariants, _ := configured[billing_setting.PluginBillingExprOption].(map[string]any)
-		if len(plugins) >= 2 || len(configuredVariants) > 0 {
+		if len(plugins) > 0 || len(configuredVariants) > 0 {
 			keys := make(map[string]bool, len(plugins)+len(configuredVariants))
 			for _, plugin := range plugins {
 				keys[plugin.Meta.Key] = true
@@ -443,10 +443,15 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 				return fmt.Errorf("model %s: plugin %s: billing expression is required", name, key)
 			}
 			plugin, exists := generation.Get(key)
-			if !exists || !slices.Contains(plugin.Meta.Models, name) {
-				if previousVariants[key] == expression {
-					continue
-				}
+			declared := exists && slices.Contains(plugin.Meta.Models, name)
+			// An unchanged override stays saveable after its plugin disappears or
+			// stops declaring the model. A sole provider also keeps it after
+			// narrowing its usage profile; relay checks shared models against
+			// each profile, so their prices must follow it.
+			if previousVariants[key] == expression && (!declared || !generation.SharedModel(name)) {
+				continue
+			}
+			if !declared {
 				return fmt.Errorf("model %s: plugin %s does not declare this model", name, key)
 			}
 			schema, _ := plugin.Meta.UsageForModel(name)
@@ -474,7 +479,7 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 				return errors.New("billing expression is required")
 			}
 			previousExpression, _ := previous[key].(string)
-			if err := smokeTestModelBillingExpr(name, expression, previousExpression, variants); err != nil {
+			if err := smokeTestModelBillingExpr(name, expression, previousExpression, variants, previousVariants); err != nil {
 				return err
 			}
 			continue
@@ -498,17 +503,23 @@ func validateModelPricing(name string, values, previous PricingValues) error {
 // schema-aware smoke tests. An unchanged stored usage expression whose plugin
 // is gone has no schema to test; preserve it so removing stale overrides or
 // saving other model prices does not become impossible.
-func smokeTestModelBillingExpr(name, expression, previousExpression string, variants map[string]any) error {
+func smokeTestModelBillingExpr(name, expression, previousExpression string, variants, previousVariants map[string]any) error {
 	// Even a model expression currently shadowed by every provider must
 	// compile; only its schema-specific smoke tests can be skipped.
 	if _, err := billingexpr.CompileFromCache(expression); err != nil {
 		return fmt.Errorf("model %s: %w", name, err)
 	}
 	generation := jsplugin.DefaultRegistry.Generation()
+	// An unchanged expression a sole provider has been charging with keeps its
+	// price after the plugin narrows its usage profile; relay checks shared
+	// models against each profile, so their prices must follow it.
+	unchanged := previousExpression == expression
 	var err error
 	if plugins := generation.PluginsByModel(name); len(plugins) > 0 {
 		for _, plugin := range plugins {
-			if _, overridden := variants[plugin.Meta.Key]; overridden {
+			_, overridden := variants[plugin.Meta.Key]
+			_, wasOverridden := previousVariants[plugin.Meta.Key]
+			if overridden || (unchanged && !wasOverridden && len(plugins) == 1) {
 				continue
 			}
 			schema, _ := plugin.Meta.UsageForModel(name)
@@ -518,14 +529,19 @@ func smokeTestModelBillingExpr(name, expression, previousExpression string, vari
 		}
 	} else if target, resolved := ResolveTaskModelAlias(generation, name); resolved {
 		if plugin, ok := generation.Get(target.PluginKey); ok {
-			schema, _ := plugin.Meta.UsageForModel(target.Declared)
-			err = billing_setting.SmokeTestTaskExpr(expression, schema)
+			if !unchanged || generation.SharedModel(target.Declared) {
+				schema, _ := plugin.Meta.UsageForModel(target.Declared)
+				err = billing_setting.SmokeTestTaskExpr(expression, schema)
+			}
 		} else {
 			err = billing_setting.SmokeTestExpr(expression)
 		}
-	} else if previousExpression != expression || len(billingexpr.UsedUsageKeys(expression)) == 0 {
+	} else if !unchanged || len(billingexpr.UsedUsageKeys(expression)) == 0 {
 		err = billing_setting.SmokeTestExpr(expression)
 	}
+	// With no remaining plugin, an unchanged stored usage expression has no
+	// schema to test. Preserve it so removing stale overrides or saving other
+	// model prices does not become impossible.
 	if err != nil {
 		return fmt.Errorf("model %s: %w", name, err)
 	}
@@ -594,9 +610,11 @@ func validateGroupPricingEntry(name, group string, entry, previousEntry map[stri
 				return fmt.Errorf("model %s: group %s: billing expression is required", name, group)
 			}
 			// An unchanged stored usage expression whose plugin is gone has no
-			// schema to test; preserve it like the model-level expression.
+			// schema to test; preserve it like the model-level expression. A group
+			// entry carries no plugin-variant history, so no previous variants are
+			// passed.
 			previousExpression, _ := previousEntry["billing_setting.billing_expr"].(string)
-			if err := smokeTestModelBillingExpr(name, expression, previousExpression, variants); err != nil {
+			if err := smokeTestModelBillingExpr(name, expression, previousExpression, variants, nil); err != nil {
 				return fmt.Errorf("model %s: group %s: %w", name, group, err)
 			}
 		default:
@@ -730,7 +748,7 @@ func mutateModelPricingOptions(mutate func(*gorm.DB, map[string]map[string]any) 
 			return err
 		}
 		if len(duplicated) > 0 {
-			common.SysError("options table has duplicate pricing keys [" + strings.Join(duplicated, ", ") + "]; the table is missing a primary key")
+			common.SysError(common.LogText("options table has duplicate pricing keys [%s]; the table is missing a primary key", strings.Join(duplicated, ", ")))
 		}
 		defaults := defaultPricingMaps()
 		for _, key := range modelPricingOptionKeys {
